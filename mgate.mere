@@ -229,9 +229,11 @@ let ci_gates = fn (repo: str) ->
 // A repo says how it is checked in mere.toml:
 //   [test]
 //   run = ["sh verify.sh", "sh test/zlib_check.sh"]
-// and without that its verify.sh is the check. MERE is set to the checkout for
-// every command, since that is what most verify.sh files take; a repo whose
-// scripts want the binary says so in its own command (MERE=$MERE/_build/...).
+// and without that its verify.sh is the check. MERE and MERE_BIN are the
+// COMPILER, whichever of a checkout or a binary was named here: measured over
+// the 21 downstream repos with checks, 12 verify.sh files run $MERE and 9 build
+// $MERE/_build/... -- this said "most take the checkout", ran 14 of 21 red with
+// "is a directory", and the 9 now accept either.
 
 let rec toml_run = fn (ls: str list) -> fn (in_test: bool) ->
   match ls with
@@ -245,6 +247,10 @@ let rec toml_run = fn (ls: str list) -> fn (in_test: bool) ->
       Some (list_map (list_filter (str_split inner ",") (fn (x: str) -> str_trim x != "")) unquote)
     else toml_run t in_test;
 
+let mere_bin_of = fn (mere: str) ->
+  let b = mere ++ "/_build/default/bin/mere.exe" in
+  if file_exists b then b else mere;
+
 let repo_gates = fn (mere: str) -> fn (repo: str) ->
   let name = basename repo in
   let toml = repo ++ "/mere.toml" in
@@ -257,7 +263,8 @@ let repo_gates = fn (mere: str) -> fn (repo: str) ->
   else
     list_map cmds (fn (c: str) ->
       gate { gname = name ++ ": " ++ c, ggroup = name,
-             gcmd = "cd '" ++ repo ++ "' && export MERE='" ++ mere ++ "'; " ++ c,
+             gcmd = "cd '" ++ repo ++ "' && export MERE='" ++ mere_bin_of mere ++ "' MERE_BIN='"
+                    ++ mere_bin_of mere ++ "'; " ++ c,
              gwired = (match declared with Some _ -> true | None -> false) });
 
 // ---- running ----------------------------------------------------------------

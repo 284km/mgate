@@ -1,7 +1,7 @@
 #!/bin/sh
 # verify.sh — mgate against a repository whose every gate's answer is known.
 #
-#   MERE=/path/to/mere-checkout sh verify.sh [--poison]
+#   MERE=/path/to/mere.exe sh verify.sh [--poison]
 #
 # The fixture is a fake repo: a CI workflow with a gates job, and scripts that
 # exit 0, 1, 2 and 3, print "skipping" and exit 0, and sleep past the timeout,
@@ -33,8 +33,11 @@
 # (the check for leftover children must).
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-[ -n "${MERE:-}" ] || { echo "usage: MERE=/path/to/mere-checkout sh verify.sh" >&2; exit 2; }
-M="$MERE/_build/default/bin/mere.exe"
+# MERE is the compiler (the convention most verify.sh files follow) or a mere
+# checkout; either works. MERE_ROOT is the checkout when one can be found.
+[ -n "${MERE:-}" ] || { echo "usage: MERE=/path/to/mere.exe (or a mere checkout) sh verify.sh" >&2; exit 2; }
+if [ -d "$MERE" ]; then MERE_ROOT="$MERE"; M="$MERE/_build/default/bin/mere.exe"
+else M="$MERE"; MERE_ROOT="$(cd "$(dirname "$MERE")/../../.." 2>/dev/null && pwd)"; fi
 [ -x "$M" ] || { echo "verify: $M not found (dune build?)" >&2; exit 2; }
 CC="${CC:-cc}"
 TMP="$(mktemp -d)"
