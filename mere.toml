@@ -1,0 +1,7 @@
+[package]
+name = "mgate"
+version = "0.1.0"
+path = "github.com/284km/mgate"
+
+[test]
+run = ["sh verify.sh"]
