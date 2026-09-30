@@ -128,6 +128,10 @@ run_checks() {  # $1 = mgate binary
   [ $rc1 -eq 1 ] || { echo "FAIL red: exit $rc1 with reds present"; bad=$((bad + 1)); }
   grep -q "unrelated" "$TMP/out1" && { echo "FAIL scope: a script from another job was run"; bad=$((bad + 1)); }
   # a timeout kills the gate's whole tree, not only its shell
+  # ⚠ WAIT FOR THE CONDITION: a KILL is delivered asynchronously and the bound
+  #   waits only for its own child, so a grandchild can still be listed for a
+  #   moment after mgate returns. Gone within 5 s is gone; still there is not.
+  i=0; while pgrep -f "sleep 3001" > /dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
   pgrep -f "sleep 3001" > /dev/null && { echo "FAIL timeout: the timed-out gate's children are still running"; pkill -f "sleep 3001"; bad=$((bad + 1)); }
 
   # --local: CANNOT and SKIP0 are reported, not red; FAIL and TIMEOUT stay red
