@@ -133,14 +133,20 @@ let rec block_after = fn (ls: str list) -> fn (key: str) ->
       else Cons (v, Nil)
     else block_after t key;
 
-// env for a step, as "export K=V;" -- a value that is a workflow expression
-// (${{ ... }}) means nothing here and is left out
+// env for a step, as "export K=V;". Two kinds of value mean nothing here and
+// are left out: a workflow expression (${{ ... }}), and an absolute path that
+// does not exist on this machine -- `MERE_DOWNSTREAM: /downstream` is where the
+// CI job cloned the downstream repos, and passing it on made downstream_check
+// fail ("set, but nothing there") where unset it says what it could not check.
 let env_prefix = fn (ls: str list) ->
   list_fold (block_after ls "env") "" (fn (acc: str) -> fn (l: str) ->
     let t = str_trim l in
     let k = str_index_of t ":" in
     if k <= 0 || str_contains t "$\{\{" then acc
-    else acc ++ "export " ++ substring t 0 k ++ "=" ++ "'" ++ unquote (substring t (k + 1) (str_len t)) ++ "'; ");
+    else
+      let v = unquote (substring t (k + 1) (str_len t)) in
+      if str_starts_with v "/" && file_exists v == false then acc
+      else acc ++ "export " ++ substring t 0 k ++ "=" ++ "'" ++ v ++ "'; ");
 
 // the command lines of a run block: comments and blanks out, `\` continuations joined
 let rec commands = fn (ls: str list) -> fn (pending: str) -> fn (acc: str list) ->
@@ -270,7 +276,11 @@ let last_line = fn (path: str) ->
 
 let classify = fn (code: int) -> fn (last: str) ->
   if code == 0 then
-    if str_contains (to_lower last) "skip" then "SKIP0" else "PASS"
+    // The skips in the mere repo say `SKIP`, `skipping` or `skip-ok`; a pass
+    // that counts what it left out says "(13 skipped)" -- decls_roundtrip's
+    // last line, read as a skip by the first version of this rule.
+    if str_contains last "SKIP" || str_contains (to_lower last) "skipping"
+       || str_contains (to_lower last) "skip-ok" then "SKIP0" else "PASS"
   else if code == 2 then "CANNOT"
   else if code == 3 then "SKIP"
   else if code == 201 then "TIMEOUT"

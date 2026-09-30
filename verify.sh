@@ -15,9 +15,12 @@
 #
 #   classes      each gate lands in its class (PASS FAIL CANNOT SKIP SKIP0
 #                TIMEOUT), and a block step with two lines is one gate while a
-#                step of two plain invocations is two
+#                step of two plain invocations is two; a pass that reports
+#                "(13 skipped)" is a PASS
 #   timeout      a gate that times out is killed with everything it started
 #   unwired      the script the workflow does not name is run, and marked
+#   env          a step's env reaches its gate, except a path that does not
+#                exist here (where CI cloned something) and ${{ }} expressions
 #   red          --local turns CANNOT and SKIP0 from red to reported; FAIL and
 #                TIMEOUT stay red either way (the exit status says so)
 #   record       a second run compares with the first: a gate that went from
@@ -40,6 +43,7 @@ trap 'rm -rf "$TMP"' EXIT
 make_repo() {  # $1 = dir, $2 = how many of the steps to keep (all | fewer | none)
   mkdir -p "$1/scripts" "$1/.github/workflows"
   printf '#!/bin/sh\necho "all good"\nexit 0\n' > "$1/scripts/pass_check.sh"
+  printf '#!/bin/sh\necho "counted: 178 programs agree (13 skipped, no exemptions)"\nexit 0\n' > "$1/scripts/counted_check.sh"
   printf '#!/bin/sh\necho "FAIL: two problems"\nexit 1\n' > "$1/scripts/fail_check.sh"
   printf '#!/bin/sh\necho "needs frobnicate -- cannot check" >&2\nexit 2\n' > "$1/scripts/cannot_check.sh"
   printf '#!/bin/sh\necho "optional, not configured here"\nexit 3\n' > "$1/scripts/optional_check.sh"
@@ -47,7 +51,7 @@ make_repo() {  # $1 = dir, $2 = how many of the steps to keep (all | fewer | non
   printf '#!/bin/sh\nsleep 3001\n' > "$1/scripts/slow_check.sh"
   printf '#!/bin/sh\n[ "${1:-}" = "--poison" ] && { echo "poison caught"; exit 0; }\necho ok\n' > "$1/scripts/pair_check.sh"
   printf '#!/bin/sh\necho "nobody runs me"\nexit 1\n' > "$1/scripts/orphan_check.sh"
-  printf '#!/bin/sh\n[ "${FLAVOR:-}" = "sweet" ] || { echo "FLAVOR not passed"; exit 1; }\necho ok\n' > "$1/scripts/env_check.sh"
+  printf '#!/bin/sh\n[ "${FLAVOR:-}" = "sweet" ] || { echo "FLAVOR not passed"; exit 1; }\n[ -z "${ELSEWHERE:-}" ] || { echo "a CI-only path was passed"; exit 1; }\necho ok\n' > "$1/scripts/env_check.sh"
   {
     echo "name: CI"
     echo "jobs:"
@@ -65,6 +69,8 @@ make_repo() {  # $1 = dir, $2 = how many of the steps to keep (all | fewer | non
     if [ "$2" != none ]; then
       echo "      - name: pass"
       echo "        run: sh scripts/pass_check.sh"
+      echo "      - name: counted (a pass that says how many it skipped)"
+      echo "        run: sh scripts/counted_check.sh"
       echo "      # a comment between steps"
       echo "      - name: \"fail (a gate that is red)\""
       echo "        if: \${{ !cancelled() }}"
@@ -80,6 +86,7 @@ make_repo() {  # $1 = dir, $2 = how many of the steps to keep (all | fewer | non
       echo "      - name: env"
       echo "        env:"
       echo "          FLAVOR: sweet"
+      echo "          ELSEWHERE: /nonexistent/ci/checkout"
       echo "          TOKEN: \${{ secrets.X }}"
       echo "        run: sh scripts/env_check.sh"
       if [ "$2" = all ]; then
@@ -122,7 +129,7 @@ run_checks() {  # $1 = mgate binary
   grep -q "env_check.sh" "$TMP/out1" && { echo "FAIL env: a step's env did not reach its gate"; bad=$((bad + 1)); }
   line="$(grep '^mgate: ' "$TMP/out1")"
   case "$line" in
-    "mgate: 11 gates -- 5 PASS, 2 FAIL, 1 TIMEOUT, 1 CANNOT, 1 SKIP0, 1 SKIP"*) ;;
+    "mgate: 12 gates -- 6 PASS, 2 FAIL, 1 TIMEOUT, 1 CANNOT, 1 SKIP0, 1 SKIP"*) ;;
     *) echo "FAIL counts: $line"; bad=$((bad + 1)) ;;
   esac
   [ $rc1 -eq 1 ] || { echo "FAIL red: exit $rc1 with reds present"; bad=$((bad + 1)); }
@@ -184,7 +191,7 @@ PY
 
 if [ "${1:-}" = "--poison" ]; then
   poison "a skip that exits 0 read as a pass" \
-    'if str_contains (to_lower last) "skip" then "SKIP0" else "PASS"' '"PASS"' \
+    'if str_contains last "SKIP" || str_contains (to_lower last) "skipping"' 'if false' \
     "FAIL class: quiet_check.sh is not SKIP0" || exit 1
   poison "a timeout that kills only the top shell" \
     'kill \"KILL\", -$pid;' 'kill \"KILL\", $pid;' \
