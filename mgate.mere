@@ -158,8 +158,22 @@ let rec commands = fn (ls: str list) -> fn (pending: str) -> fn (acc: str list) 
     else if str_ends_with s "\\" then commands t (pending ++ substring s 0 (str_len s - 1) ++ " ") acc
     else commands t "" (Cons (pending ++ s, acc));
 
-// "opam exec -- " is how CI finds dune; here it is on PATH
-let local_cmd = fn (c: str) -> str_replace c "opam exec -- " "";
+// A command as it runs here. "opam exec -- " is how CI finds dune; here it is
+// on PATH. And a leading assignment whose value names the runner
+// (`MERE_DOWNSTREAM="$RUNNER_TEMP/downstream" sh scripts/downstream_check.sh`)
+// means a directory on the CI machine: here $RUNNER_TEMP is empty, the value
+// became /downstream, and the gate failed on a path nobody meant. It is left
+// out, as a step `env:` path that does not exist here is.
+let runner_value = fn (w: str) ->
+  str_contains w "=" && (str_contains w "$RUNNER_" || str_contains w "$GITHUB_"
+                         || str_contains w "$\{RUNNER_" || str_contains w "$\{GITHUB_");
+let local_cmd = fn (c: str) ->
+  let c1 = str_replace c "opam exec -- " "" in
+  let rec strip_runner = fn (ws: str list) ->
+    match ws with
+    | Cons (w, rest) -> if runner_value w then strip_runner rest else ws
+    | Nil -> Nil in
+  str_join " " (strip_runner (str_split c1 " "));
 
 // a line that is one gate invocation: [VAR=value ...] sh scripts/<x>.sh [args]
 let is_simple = fn (c: str) ->

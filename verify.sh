@@ -51,7 +51,7 @@ make_repo() {  # $1 = dir, $2 = how many of the steps to keep (all | fewer | non
   printf '#!/bin/sh\nsleep 3001\n' > "$1/scripts/slow_check.sh"
   printf '#!/bin/sh\n[ "${1:-}" = "--poison" ] && { echo "poison caught"; exit 0; }\necho ok\n' > "$1/scripts/pair_check.sh"
   printf '#!/bin/sh\necho "nobody runs me"\nexit 1\n' > "$1/scripts/orphan_check.sh"
-  printf '#!/bin/sh\n[ "${FLAVOR:-}" = "sweet" ] || { echo "FLAVOR not passed"; exit 1; }\n[ -z "${ELSEWHERE:-}" ] || { echo "a CI-only path was passed"; exit 1; }\necho ok\n' > "$1/scripts/env_check.sh"
+  printf '#!/bin/sh\n[ "${FLAVOR:-}" = "sweet" ] || { echo "FLAVOR not passed"; exit 1; }\n[ -z "${ELSEWHERE:-}${ELSEWHERE2:-}" ] || { echo "a CI-only path was passed"; exit 1; }\necho ok\n' > "$1/scripts/env_check.sh"
   {
     echo "name: CI"
     echo "jobs:"
@@ -88,7 +88,7 @@ make_repo() {  # $1 = dir, $2 = how many of the steps to keep (all | fewer | non
       echo "          FLAVOR: sweet"
       echo "          ELSEWHERE: /nonexistent/ci/checkout"
       echo "          TOKEN: \${{ secrets.X }}"
-      echo "        run: sh scripts/env_check.sh"
+      echo "        run: ELSEWHERE2=\"\$RUNNER_TEMP/downstream\" sh scripts/env_check.sh"
       if [ "$2" = all ]; then
         echo "      - name: pair (two invocations, two gates)"
         echo "        run: |"
