@@ -1,0 +1,450 @@
+// mgate — run every gate a repository has, and say what changed since last time.
+//
+//   mgate ci <repo> [options]            the gates a CI workflow runs, and the
+//                                        scripts/*_check.sh it does not
+//   mgate verify <mere> <repo>... [opts] each repo's declared checks: the
+//                                        `run` list under [test] in mere.toml,
+//                                        or its verify.sh
+//
+//   --jobs N        gates at once (default 4)
+//   --timeout S     seconds a gate may take (default 900)
+//   --local         a gate that could not answer (exit 2, or a skip that
+//                   exits 0) is reported, not red
+//   --no-poison     leave out the invocations that pass --poison
+//   --only WORD     only the gates whose name contains WORD
+//   --record PATH   where the last run is kept (default ~/.cache/mgate/<name>.json)
+//   --list          print the derived gates and run nothing
+//
+// Why this exists: a gate whose tool is missing
+// printed "skipping" and exited 0, so 65 of them could not fail; a gate in no
+// workflow was red and nobody ran it; and choosing only the "relevant" gates
+// hid three reds, two of them on main. So:
+//
+//   * the list is DERIVED, never written by hand: every `run:` of the CI
+//     workflow's gates job, plus every scripts/*_check.sh the workflow does not
+//     name (reported as unwired). An empty list is a failure, and a list
+//     shorter than the last run's is a failure unless --accept-fewer
+//   * exit codes are classes: 0 PASS, 1 FAIL, 2 CANNOT (the gate could not
+//     answer: a tool is missing), 3 SKIP (declared optional), 201 TIMEOUT.
+//     A 0 whose last line says "skip" is SKIP0 -- an undeclared skip, the
+//     thing that let 65 gates pass without running -- and is red unless --local
+//   * every run is compared with the last one, group by group, and what went
+//     from green to red is printed first
+//
+// The record is a list of records, not a Map: `of_json` cannot read a Map back
+// (Q-118), so the map from name to last status is rebuilt after reading.
+
+type gate = { gname: str, ggroup: str, gcmd: str, gwired: bool };
+type outcome = { name: str, group: str, status: str, code: int, ms: int, last: str, wired: bool };
+
+// ---- small things ----------------------------------------------------------
+
+let rec indent_of = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && char_at s i == " " then indent_of s (i + 1) else i;
+
+let unquote = fn (s: str) ->
+  let t = str_trim s in
+  if str_len t >= 2 && ((str_starts_with t "\"" && str_ends_with t "\"")
+                        || (str_starts_with t "'" && str_ends_with t "'"))
+  then substring t 1 (str_len t - 1) else t;
+
+let basename = fn (p: str) ->
+  match list_rev (str_split p "/") with
+  | Cons (h, _) -> h
+  | Nil -> p;
+
+// a script's family: its name up to the first underscore (parity, rv, wasm, fmt...)
+let family = fn (script: str) ->
+  let b = basename script in
+  let b2 = if str_ends_with b ".sh" then substring b 0 (str_len b - 3) else b in
+  match str_split b2 "_" with
+  | Cons (h, _) -> h
+  | Nil -> b2;
+
+let rec is_script_char = fn (c: str) ->
+  (c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c == "_" || c == "." || c == "-";
+
+// every "scripts/<name>.sh" in a line
+let rec scripts_in = fn (s: str) -> fn (acc: str list) ->
+  let k = str_index_of s "scripts/" in
+  if k < 0 then acc
+  else
+    let rest = substring s (k + 8) (str_len s) in
+    let rec word = fn (i: int) -> if i < str_len rest && is_script_char (char_at rest i) then word (i + 1) else i in
+    let n = word 0 in
+    let w = substring rest 0 n in
+    let acc2 = if str_ends_with w ".sh" then Cons (w, acc) else acc in
+    scripts_in (substring rest n (str_len rest)) acc2;
+
+let first_script = fn (s: str) ->
+  match list_rev (scripts_in s Nil) with
+  | Cons (h, _) -> h
+  | Nil -> "";
+
+// ---- reading the CI workflow ------------------------------------------------
+//
+// Only as much YAML as a workflow's steps use: `- name:`, `run:` (one line, or
+// a `|` block), `env:` with `KEY: value` lines. Anything else in a step is
+// skipped. The gates job ends at the next key at the jobs' indent.
+
+type step = { sname: str, slines: str list };
+
+// the lines of one job
+let rec job_lines = fn (ls: str list) -> fn (job: str) -> fn (inside: bool) -> fn (acc: str list) ->
+  match ls with
+  | Nil -> list_rev acc
+  | Cons (l, t) ->
+    if inside then
+      if str_len (str_trim l) > 0 && indent_of l 0 == 2 && str_ends_with (str_trim l) ":" then list_rev acc
+      else job_lines t job true (Cons (l, acc))
+    else job_lines t job (str_trim l == job ++ ":" && indent_of l 0 == 2) acc;
+
+// cut a job into steps at "- " at the steps' indent
+let rec cut_steps = fn (ls: str list) -> fn (cur: str list) -> fn (acc: str list list) ->
+  match ls with
+  | Nil -> list_rev (Cons (list_rev cur, acc))
+  | Cons (l, t) ->
+    if str_starts_with (str_trim l) "- " && indent_of l 0 == 6 then
+      cut_steps t (Cons (l, Nil)) (Cons (list_rev cur, acc))
+    else cut_steps t (Cons (l, cur)) acc;
+
+let step_name = fn (ls: str list) ->
+  match list_find ls (fn (l: str) -> str_contains l "name:") with
+  | Some l -> unquote (substring l (str_index_of l "name:" + 5) (str_len l))
+  | None -> "";
+
+// the lines under a key: its own value, or the more-indented block after it
+let rec block_after = fn (ls: str list) -> fn (key: str) ->
+  match ls with
+  | Nil -> Nil
+  | Cons (l, t) ->
+    let tl = str_trim l in
+    if indent_of l 0 == 8 && str_starts_with tl (key ++ ":") then
+      let v = str_trim (substring tl (str_len key + 1) (str_len tl)) in
+      if v == "|" || v == "" then
+        let rec take = fn (xs: str list) -> fn (acc: str list) ->
+          match xs with
+          | Nil -> list_rev acc
+          | Cons (x, rest) ->
+            if str_len (str_trim x) > 0 && indent_of x 0 <= 8 then list_rev acc
+            else take rest (Cons (x, acc)) in
+        take t Nil
+      else Cons (v, Nil)
+    else block_after t key;
+
+// env for a step, as "export K=V;" -- a value that is a workflow expression
+// (${{ ... }}) means nothing here and is left out
+let env_prefix = fn (ls: str list) ->
+  list_fold (block_after ls "env") "" (fn (acc: str) -> fn (l: str) ->
+    let t = str_trim l in
+    let k = str_index_of t ":" in
+    if k <= 0 || str_contains t "$\{\{" then acc
+    else acc ++ "export " ++ substring t 0 k ++ "=" ++ "'" ++ unquote (substring t (k + 1) (str_len t)) ++ "'; ");
+
+// the command lines of a run block: comments and blanks out, `\` continuations joined
+let rec commands = fn (ls: str list) -> fn (pending: str) -> fn (acc: str list) ->
+  match ls with
+  | Nil -> list_rev (if pending == "" then acc else Cons (pending, acc))
+  | Cons (l, t) ->
+    let s = str_trim l in
+    if s == "" || str_starts_with s "#" then commands t pending acc
+    else if str_ends_with s "\\" then commands t (pending ++ substring s 0 (str_len s - 1) ++ " ") acc
+    else commands t "" (Cons (pending ++ s, acc));
+
+// "opam exec -- " is how CI finds dune; here it is on PATH
+let local_cmd = fn (c: str) -> str_replace c "opam exec -- " "";
+
+// a line that is one gate invocation: [VAR=value ...] sh scripts/<x>.sh [args]
+let is_simple = fn (c: str) ->
+  let rec go = fn (ws: str list) ->
+    match ws with
+    | Cons (w, rest) ->
+      if w == "sh" then (match rest with Cons (s, _) -> str_starts_with s "scripts/" | Nil -> false)
+      else if str_contains w "=" && str_starts_with w "-" == false then go rest
+      else false
+    | Nil -> false in
+  // a line that chains (&&, ||, |, ;) is a small script, not one invocation
+  if str_contains c "&&" || str_contains c "|" || str_contains c ";" then false
+  else go (str_split (local_cmd c) " ");
+
+// one step -> its gates. A step whose every line is a single invocation gives
+// one gate per line (so a poison is its own row); anything else is one gate
+// that runs the block the way the workflow does (bash -e: the first failure
+// ends it).
+let step_gates = fn (ls: str list) ->
+  let name = step_name ls in
+  let cmds = list_map (commands (block_after ls "run") "" Nil) local_cmd in
+  let env = env_prefix ls in
+  let body = list_fold cmds "" (fn (a: str) -> fn (c: str) -> a ++ c ++ "\n") in
+  if cmds == Nil then Nil
+  else if str_contains body "scripts/" == false && str_contains body "dune runtest" == false then Nil
+  else if list_for_all cmds is_simple then
+    list_map cmds (fn (c: str) ->
+      let s = first_script c in
+      let args = str_trim (substring c (str_index_of c s + str_len s) (str_len c)) in
+      gate { gname = basename s ++ (if args == "" then "" else " " ++ args),
+             ggroup = family s, gcmd = env ++ c, gwired = true })
+  else
+    let s = first_script body in
+    Cons (gate { gname = name, ggroup = (if s == "" then "unit" else family s),
+                 gcmd = env ++ "set -e\n" ++ body, gwired = true }, Nil);
+
+let ci_gates = fn (repo: str) ->
+  let wf = repo ++ "/.github/workflows/ci.yml" in
+  let text = read_file wf in
+  let lines = str_split text "\n" in
+  let steps = cut_steps (job_lines lines "gates" false Nil) Nil Nil in
+  let wired = list_fold (list_map steps step_gates) Nil (fn (a: gate list) -> fn (g: gate list) -> list_append a g) in
+  // every script the workflow names ANYWHERE, so a script used by another job
+  // is not called unwired
+  let named = list_fold lines Nil (fn (a: str list) -> fn (l: str) -> scripts_in l a) in
+  let checks = list_sort (list_filter (list_dir (repo ++ "/scripts")) (fn (f: str) -> str_ends_with f "_check.sh")) in
+  let unwired = list_map (list_filter checks (fn (f: str) -> list_member named f == false)) (fn (f: str) ->
+    gate { gname = f, ggroup = family f, gcmd = "sh scripts/" ++ f, gwired = false }) in
+  list_append wired unwired;
+
+// ---- downstream repos ---------------------------------------------------------
+//
+// A repo says how it is checked in mere.toml:
+//   [test]
+//   run = ["sh verify.sh", "sh test/zlib_check.sh"]
+// and without that its verify.sh is the check. MERE is set to the checkout for
+// every command, since that is what most verify.sh files take; a repo whose
+// scripts want the binary says so in its own command (MERE=$MERE/_build/...).
+
+let rec toml_run = fn (ls: str list) -> fn (in_test: bool) ->
+  match ls with
+  | Nil -> None
+  | Cons (l, t) ->
+    let s = str_trim l in
+    if str_starts_with s "[" then toml_run t (s == "[test]")
+    else if in_test && str_starts_with s "run" && str_contains s "=" then
+      let v = str_trim (substring s (str_index_of s "=" + 1) (str_len s)) in
+      let inner = substring v 1 (str_len v - 1) in
+      Some (list_map (list_filter (str_split inner ",") (fn (x: str) -> str_trim x != "")) unquote)
+    else toml_run t in_test;
+
+let repo_gates = fn (mere: str) -> fn (repo: str) ->
+  let name = basename repo in
+  let toml = repo ++ "/mere.toml" in
+  let declared = if file_exists toml then toml_run (str_split (read_file toml) "\n") false else None in
+  let cmds = match declared with
+    | Some cs -> cs
+    | None -> if file_exists (repo ++ "/verify.sh") then Cons ("sh verify.sh", Nil) else Nil in
+  if cmds == Nil then
+    Cons (gate { gname = name ++ ": (nothing declared)", ggroup = name, gcmd = "exit 2", gwired = false }, Nil)
+  else
+    list_map cmds (fn (c: str) ->
+      gate { gname = name ++ ": " ++ c, ggroup = name,
+             gcmd = "cd '" ++ repo ++ "' && export MERE='" ++ mere ++ "'; " ++ c,
+             gwired = (match declared with Some _ -> true | None -> false) });
+
+// ---- running ----------------------------------------------------------------
+
+// the wall-clock bound, as scripts/bounded.sh in the mere repo has it: perl's
+// alarm, because macOS has no timeout(1) and ulimit -t bounds CPU, not time.
+// One difference: the gate runs in a process group of its own and a timeout
+// kills the GROUP. Killing only the top shell leaves its children running --
+// a `sleep`, or a server still holding its port for the next gate.
+let bounded_sh =
+  "exec perl -e '\n"
+  ++ "  my $secs = shift @ARGV;\n"
+  ++ "  my $pid = fork();\n"
+  ++ "  defined $pid or exit 202;\n"
+  ++ "  if ($pid == 0) \{ setpgrp(0, 0); exec \{ $ARGV[0] } @ARGV or exit 127 }\n"
+  ++ "  $SIG\{ALRM} = sub \{ kill \"KILL\", -$pid; waitpid($pid, 0); exit 201 };\n"
+  ++ "  alarm $secs;\n"
+  ++ "  waitpid($pid, 0);\n"
+  ++ "  alarm 0;\n"
+  ++ "  exit($? & 127 ? 128 + ($? & 127) : $? >> 8);\n"
+  ++ "' \"$@\"\n";
+
+let last_line = fn (path: str) ->
+  if file_exists path == false then ""
+  else
+    let ls = list_filter (str_split (read_file path) "\n") (fn (l: str) -> str_trim l != "") in
+    match list_rev ls with
+    | Cons (h, _) -> str_trim h
+    | Nil -> "";
+
+let classify = fn (code: int) -> fn (last: str) ->
+  if code == 0 then
+    if str_contains (to_lower last) "skip" then "SKIP0" else "PASS"
+  else if code == 2 then "CANNOT"
+  else if code == 3 then "SKIP"
+  else if code == 201 then "TIMEOUT"
+  else "FAIL";
+
+let rec nth = fn (xs: gate list) -> fn (i: int) ->
+  match xs with
+  | Cons (h, t) -> if i == 0 then h else nth t (i - 1)
+  | Nil -> gate { gname = "", ggroup = "", gcmd = "exit 1", gwired = false };
+
+let run_all = fn (repo: str) -> fn (gates: gate list) -> fn (jobs: int) -> fn (secs: int) -> fn (tmp: str) ->
+  let n = list_len gates in
+  let _ = write_file (tmp ++ "/bounded.sh") bounded_sh in
+  let rec write_scripts = fn (gs: gate list) -> fn (i: int) ->
+    match gs with
+    | Nil -> ()
+    | Cons (g, t) ->
+      let _ = write_file (tmp ++ "/" ++ str_of_int i ++ ".sh") ("cd '" ++ repo ++ "' || exit 2\n" ++ g.gcmd ++ "\n") in
+      write_scripts t (i + 1) in
+  let _ = write_scripts gates 0 in
+  let q = channel_new () in
+  let out = channel_new () in
+  let rec fill = fn (i: int) -> if i == n then () else let _ = channel_send q i in fill (i + 1) in
+  let _ = fill 0 in
+  let _ = channel_close q in
+  let worker = fn () ->
+    let rec loop = fn (u: unit) ->
+      match channel_recv_opt q with
+      | None -> ()
+      | Some i ->
+        let p = tmp ++ "/" ++ str_of_int i in
+        let t0 = time () in
+        let code = run ("sh '" ++ tmp ++ "/bounded.sh' " ++ str_of_int secs ++ " sh '" ++ p ++ ".sh' < /dev/null > '" ++ p ++ ".out' 2>&1") in
+        let ms = int_of_float ((time () - t0) * 1000.0) in
+        let _ = channel_send out (i, code, ms) in
+        loop () in
+    loop () in
+  let rec spawn_n = fn (k: int) -> fn (acc: ThreadHandle list) ->
+    if k == 0 then acc else spawn_n (k - 1) (Cons (spawn worker, acc)) in
+  let hs = spawn_n (if jobs < 1 then 1 else jobs) Nil in
+  let rec collect = fn (k: int) -> fn (acc: outcome list) ->
+    if k == n then acc
+    else
+      let (i, code, ms) = channel_recv out in
+      let g = nth gates i in
+      let last = last_line (tmp ++ "/" ++ str_of_int i ++ ".out") in
+      let st = classify code last in
+      let _ = print_err ("  " ++ st ++ "  " ++ g.gname ++ "  (" ++ str_of_int (ms / 1000) ++ "s)") in
+      collect (k + 1) (Cons (outcome { name = g.gname, group = g.ggroup, status = st, code = code,
+                                      ms = ms, last = last, wired = g.gwired }, acc)) in
+  let rs = collect 0 Nil in
+  let _ = list_iter hs (fn (h: ThreadHandle) -> join h) in
+  list_sort_by (fn (a: outcome) -> fn (b: outcome) -> a.name < b.name) rs;
+
+// ---- reporting ----------------------------------------------------------------
+
+let is_red = fn (local: bool) -> fn (st: str) ->
+  st == "FAIL" || st == "TIMEOUT" || (local == false && (st == "CANNOT" || st == "SKIP0"));
+
+let pad = fn (s: str) -> fn (w: int) ->
+  if str_len s >= w then s else s ++ str_repeat " " (w - str_len s);
+
+let report = fn (rs: outcome list) -> fn (prev: outcome list) -> fn (local: bool) -> fn (tmp: str) ->
+  let old = map_new () in
+  let _ = list_iter prev (fn (r: outcome) -> map_set old r.name r.status) in
+  let was = fn (r: outcome) -> if map_has old r.name then map_get old r.name else "NEW" in
+  // what changed, worst first: green to red, then anything else that moved
+  let changed = list_filter rs (fn (r: outcome) -> was r != r.status && was r != "NEW") in
+  let went_red = list_filter changed (fn (r: outcome) -> is_red local r.status && is_red local (was r) == false) in
+  let others = list_filter changed (fn (r: outcome) -> (is_red local r.status && is_red local (was r) == false) == false) in
+  let _ = if went_red != Nil then
+      let _ = print "== went red since the last run" in
+      list_iter went_red (fn (r: outcome) -> print ("   " ++ pad (was r ++ " -> " ++ r.status) 20 ++ r.name ++ "   | " ++ r.last))
+    else () in
+  let _ = if others != Nil then
+      let _ = print "== changed since the last run" in
+      list_iter others (fn (r: outcome) -> print ("   " ++ pad (was r ++ " -> " ++ r.status) 20 ++ r.name))
+    else () in
+  let gone = list_filter prev (fn (p: outcome) -> list_any rs (fn (r: outcome) -> r.name == p.name) == false) in
+  let _ = if gone != Nil then
+      let _ = print "== in the last run, not in this one" in
+      list_iter gone (fn (p: outcome) -> print ("   " ++ p.name))
+    else () in
+  let reds = list_filter rs (fn (r: outcome) -> is_red local r.status) in
+  let _ = if reds != Nil then
+      let _ = print "== red" in
+      list_iter reds (fn (r: outcome) ->
+        print ("   " ++ pad r.status 8 ++ pad r.name 44 ++ (if r.wired then "" else "[unwired] ") ++ "| " ++ r.last))
+    else () in
+  let soft = list_filter rs (fn (r: outcome) -> is_red local r.status == false && r.status != "PASS") in
+  let _ = if soft != Nil then
+      let _ = print "== not red, not passed" in
+      list_iter soft (fn (r: outcome) -> print ("   " ++ pad r.status 8 ++ pad r.name 44 ++ "| " ++ r.last))
+    else () in
+  // per group: pass / red / other, and the unwired count
+  let groups = list_sort (list_fold rs Nil (fn (a: str list) -> fn (r: outcome) ->
+    if list_member a r.group then a else Cons (r.group, a))) in
+  let _ = print "== by group" in
+  let _ = list_iter groups (fn (g: str) ->
+    let in_g = list_filter rs (fn (r: outcome) -> r.group == g) in
+    let p = list_len (list_filter in_g (fn (r: outcome) -> r.status == "PASS")) in
+    let red = list_len (list_filter in_g (fn (r: outcome) -> is_red local r.status)) in
+    let uw = list_len (list_filter in_g (fn (r: outcome) -> r.wired == false)) in
+    print ("   " ++ pad g 16 ++ str_of_int p ++ "/" ++ str_of_int (list_len in_g) ++ " pass"
+           ++ (if red > 0 then ", " ++ str_of_int red ++ " red" else "")
+           ++ (if uw > 0 then ", " ++ str_of_int uw ++ " unwired" else ""))) in
+  let count = fn (st: str) -> list_len (list_filter rs (fn (r: outcome) -> r.status == st)) in
+  let _ = print ("mgate: " ++ str_of_int (list_len rs) ++ " gates -- "
+                 ++ str_of_int (count "PASS") ++ " PASS, " ++ str_of_int (count "FAIL") ++ " FAIL, "
+                 ++ str_of_int (count "TIMEOUT") ++ " TIMEOUT, " ++ str_of_int (count "CANNOT") ++ " CANNOT, "
+                 ++ str_of_int (count "SKIP0") ++ " SKIP0, " ++ str_of_int (count "SKIP") ++ " SKIP"
+                 ++ (if local then " (--local)" else "") ++ "; output in " ++ tmp) in
+  list_len reds;
+
+// ---- options ------------------------------------------------------------------
+
+type opts = { jobs: int, secs: int, local: bool, poison: bool, only: str, record: str, fewer: bool, list: bool, rest: str list };
+
+let rec parse_opts = fn (xs: str list) -> fn (o: opts) ->
+  match xs with
+  | Nil -> { o | rest = list_rev o.rest }
+  | Cons (x, t) ->
+    (match t with
+     | Cons (v, t2) when x == "--jobs" -> parse_opts t2 { o | jobs = int_of_str v }
+     | Cons (v, t2) when x == "--timeout" -> parse_opts t2 { o | secs = int_of_str v }
+     | Cons (v, t2) when x == "--only" -> parse_opts t2 { o | only = v }
+     | Cons (v, t2) when x == "--record" -> parse_opts t2 { o | record = v }
+     | _ ->
+       if x == "--local" then parse_opts t { o | local = true }
+       else if x == "--no-poison" then parse_opts t { o | poison = false }
+       else if x == "--accept-fewer" then parse_opts t { o | fewer = true }
+       else if x == "--list" then parse_opts t { o | list = true }
+       else parse_opts t { o | rest = Cons (x, o.rest) });
+
+let usage = "usage: mgate ci <repo> [options] | mgate verify <mere-checkout> <repo>... [options]";
+
+let home = match env_var "HOME" with Some h -> h | None -> "/tmp";
+
+let main = fn () ->
+  let o = parse_opts (args ()) (opts { jobs = 4, secs = 900, local = false, poison = true,
+                                       only = "", record = "", fewer = false, list = false, rest = Nil }) in
+  let chosen = match o.rest with
+    | Cons ("ci", Cons (repo, Nil)) -> Some (basename repo, repo, ci_gates repo)
+    | Cons ("verify", Cons (mere, repos)) ->
+      if repos == Nil then None
+      else Some ("verify", "/", list_fold (list_map repos (repo_gates mere)) Nil
+                                  (fn (a: gate list) -> fn (g: gate list) -> list_append a g))
+    | _ -> None in
+  match chosen with
+  | None -> let _ = print usage in 2
+  | Some (name, repo, all) ->
+    let gates = list_filter all (fn (g: gate) ->
+      (o.poison || str_contains g.gname "--poison" == false)
+      && (o.only == "" || str_contains g.gname o.only)) in
+    let record = if o.record == "" then home ++ "/.cache/mgate/" ++ name ++ ".json" else o.record in
+    let prev = if file_exists record then (of_json (read_file record) : outcome list) else Nil in
+    let n = list_len gates in
+    if o.list then
+      let _ = list_iter gates (fn (g: gate) ->
+        print (pad g.ggroup 14 ++ (if g.gwired then "         " else "unwired  ") ++ g.gname)) in
+      let _ = print (str_of_int n ++ " gates") in 0
+    else
+    // the list is derived, so a shorter one is news: a gate renamed away, a
+    // workflow step lost, or a parse that stopped matching
+    let floor = if o.only != "" || o.poison == false then 1 else list_len prev in
+    if n == 0 then let _ = print "mgate: no gates found -- an empty list is not a pass" in 1
+    else if n < floor && o.fewer == false then
+      let _ = print ("mgate: " ++ str_of_int n ++ " gates, the last run had " ++ str_of_int floor
+                     ++ " -- rerun with --accept-fewer if that is intended") in 1
+    else
+      let tmp = home ++ "/.cache/mgate/" ++ name ++ ".run" in
+      let _ = run ("rm -rf '" ++ tmp ++ "' && mkdir -p '" ++ tmp ++ "'") in
+      let rs = run_all repo gates o.jobs o.secs tmp in
+      let reds = report rs prev o.local tmp in
+      // a partial run (--only / --no-poison) is not the record the next full run compares with
+      let _ = if o.only == "" && o.poison then write_file record (to_json rs) else () in
+      if reds > 0 then 1 else 0;
+exit (main ())
