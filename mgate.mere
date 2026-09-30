@@ -48,8 +48,9 @@ let unquote = fn (s: str) ->
                         || (str_starts_with t "'" && str_ends_with t "'"))
   then substring t 1 (str_len t - 1) else t;
 
+// the last non-empty segment: "a/b/" is b, as it is for basename(1)
 let basename = fn (p: str) ->
-  match list_rev (str_split p "/") with
+  match list_rev (list_filter (str_split p "/") (fn (x: str) -> x != "")) with
   | Cons (h, _) -> h
   | Nil -> p;
 
@@ -326,6 +327,13 @@ let run_all = fn (repo: str) -> fn (gates: gate list) -> fn (jobs: int) -> fn (s
 
 // ---- reporting ----------------------------------------------------------------
 
+// what a gate that is not declared is called: in ci mode a script no workflow
+// names ("unwired"); in verify mode a repo's verify.sh found by convention,
+// with no [test] list in its mere.toml ("implicit")
+let undeclared_word = fn (name: str) -> fn (group: str) ->
+  if str_starts_with name (group ++ ": ") then "implicit" else "unwired";
+
+
 let is_red = fn (local: bool) -> fn (st: str) ->
   st == "FAIL" || st == "TIMEOUT" || (local == false && (st == "CANNOT" || st == "SKIP0"));
 
@@ -357,7 +365,7 @@ let report = fn (rs: outcome list) -> fn (prev: outcome list) -> fn (local: bool
   let _ = if reds != Nil then
       let _ = print "== red" in
       list_iter reds (fn (r: outcome) ->
-        print ("   " ++ pad r.status 8 ++ pad r.name 44 ++ (if r.wired then "" else "[unwired] ") ++ "| " ++ r.last))
+        print ("   " ++ pad r.status 8 ++ pad r.name 44 ++ (if r.wired then "" else "[" ++ undeclared_word r.name r.group ++ "] ") ++ "| " ++ r.last))
     else () in
   let soft = list_filter rs (fn (r: outcome) -> is_red local r.status == false && r.status != "PASS") in
   let _ = if soft != Nil then
@@ -375,7 +383,7 @@ let report = fn (rs: outcome list) -> fn (prev: outcome list) -> fn (local: bool
     let uw = list_len (list_filter in_g (fn (r: outcome) -> r.wired == false)) in
     print ("   " ++ pad g 16 ++ str_of_int p ++ "/" ++ str_of_int (list_len in_g) ++ " pass"
            ++ (if red > 0 then ", " ++ str_of_int red ++ " red" else "")
-           ++ (if uw > 0 then ", " ++ str_of_int uw ++ " unwired" else ""))) in
+           ++ (if uw > 0 then ", " ++ str_of_int uw ++ " not declared" else ""))) in
   let count = fn (st: str) -> list_len (list_filter rs (fn (r: outcome) -> r.status == st)) in
   let _ = print ("mgate: " ++ str_of_int (list_len rs) ++ " gates -- "
                  ++ str_of_int (count "PASS") ++ " PASS, " ++ str_of_int (count "FAIL") ++ " FAIL, "
@@ -429,7 +437,7 @@ let main = fn () ->
     let n = list_len gates in
     if o.list then
       let _ = list_iter gates (fn (g: gate) ->
-        print (pad g.ggroup 14 ++ (if g.gwired then "         " else "unwired  ") ++ g.gname)) in
+        print (pad g.ggroup 14 ++ pad (if g.gwired then "" else undeclared_word g.gname g.ggroup) 10 ++ g.gname)) in
       let _ = print (str_of_int n ++ " gates") in 0
     else
     // the list is derived, so a shorter one is news: a gate renamed away, a
