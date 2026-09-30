@@ -17,7 +17,8 @@
 #                TIMEOUT), and a block step with two lines is one gate while a
 #                step of two plain invocations is two; a pass that reports
 #                "(13 skipped)" is a PASS
-#   timeout      a gate that times out is killed with everything it started
+#   timeout      a gate that times out is killed with everything it started,
+#                and so is every running gate when mgate itself is stopped
 #   unwired      the script the workflow does not name is run, and marked
 #   env          a step's env reaches its gate, except a path that does not
 #                exist here (where CI cloned something) and ${{ }} expressions
@@ -28,9 +29,10 @@
 #   floor        a workflow that lost a step is refused, not run
 #   empty        a workflow with no gates is a failure, not a pass
 #
-# --poison builds two broken copies: a classifier that ignores the skip text
-# (the SKIP0 check must catch it), and a timeout that kills only the top shell
-# (the check for leftover children must).
+# --poison builds three broken copies: a classifier that ignores the skip text
+# (the SKIP0 check must catch it), a timeout that kills only the top shell (the
+# check for leftover children must), and a bound that does not notice mgate is
+# gone (the check that stopping mgate stops its gates must).
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 # MERE is the compiler (the convention most verify.sh files follow) or a mere
@@ -151,6 +153,15 @@ run_checks() {  # $1 = mgate binary
   sed -n '/^== red/,/^== /p' "$TMP/out2" | grep -q "slow_check" \
     || { echo "FAIL --local: TIMEOUT is no longer red"; bad=$((bad + 1)); }
 
+  # killing mgate stops the gates it is running (their groups are their own,
+  # so the bound has to notice its parent is gone)
+  "$B" ci "$TMP/repo" --timeout 60 --record "$TMP/killed.json" > /dev/null 2>&1 &
+  MG=$!
+  i=0; until pgrep -f "sleep 3001" > /dev/null || [ $i -ge 100 ]; do sleep 0.1; i=$((i + 1)); done
+  kill $MG 2>/dev/null; wait $MG 2>/dev/null
+  i=0; while pgrep -f "sleep 3001" > /dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  pgrep -f "sleep 3001" > /dev/null && { echo "FAIL killed: mgate was stopped and its gate is still running"; pkill -f "sleep 3001"; bad=$((bad + 1)); }
+
   # the record: pass_check goes red, and the second run says so first
   printf '#!/bin/sh\necho "broken now"\nexit 1\n' > "$TMP/repo/scripts/pass_check.sh"
   "$B" ci "$TMP/repo" --timeout 15 > "$TMP/out3" 2>/dev/null
@@ -197,8 +208,11 @@ if [ "${1:-}" = "--poison" ]; then
     'if str_contains last "SKIP" || str_contains (to_lower last) "skipping"' 'if false' \
     "FAIL class: quiet_check.sh is not SKIP0" || exit 1
   poison "a timeout that kills only the top shell" \
-    'kill \"KILL\", -$pid;' 'kill \"KILL\", $pid;' \
+    'if (time >= $deadline) \{ kill \"KILL\", -$pid;' 'if (time >= $deadline) \{ kill \"KILL\", $pid;' \
     "FAIL timeout: the timed-out gate's children" || exit 1
+  poison "a bound that does not watch mgate" \
+    'if (getppid() != $parent)' 'if (0)' \
+    "FAIL killed: mgate was stopped" || exit 1
   echo "verify --poison: ok"; exit 0
 fi
 

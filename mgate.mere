@@ -274,17 +274,25 @@ let repo_gates = fn (mere: str) -> fn (repo: str) ->
 // One difference: the gate runs in a process group of its own and a timeout
 // kills the GROUP. Killing only the top shell leaves its children running --
 // a `sleep`, or a server still holding its port for the next gate.
+// And because the group is its own, killing mgate did not reach it: a stopped
+// run left its gates running (a `dune test` that then held the build lock).
+// So the bound also watches its parent -- this process is exec'd straight
+// from mgate's `run` -- and kills the group when mgate is gone.
 let bounded_sh =
   "exec perl -e '\n"
+  ++ "  use POSIX qw(:sys_wait_h);\n"
   ++ "  my $secs = shift @ARGV;\n"
+  ++ "  my $parent = getppid();\n"
   ++ "  my $pid = fork();\n"
   ++ "  defined $pid or exit 202;\n"
   ++ "  if ($pid == 0) \{ setpgrp(0, 0); exec \{ $ARGV[0] } @ARGV or exit 127 }\n"
-  ++ "  $SIG\{ALRM} = sub \{ kill \"KILL\", -$pid; waitpid($pid, 0); exit 201 };\n"
-  ++ "  alarm $secs;\n"
-  ++ "  waitpid($pid, 0);\n"
-  ++ "  alarm 0;\n"
-  ++ "  exit($? & 127 ? 128 + ($? & 127) : $? >> 8);\n"
+  ++ "  my $deadline = time + $secs;\n"
+  ++ "  while (1) \{\n"
+  ++ "    if (waitpid($pid, WNOHANG) == $pid) \{ exit($? & 127 ? 128 + ($? & 127) : $? >> 8) }\n"
+  ++ "    if (getppid() != $parent) \{ kill \"KILL\", -$pid; waitpid($pid, 0); exit 143 }\n"
+  ++ "    if (time >= $deadline) \{ kill \"KILL\", -$pid; waitpid($pid, 0); exit 201 }\n"
+  ++ "    select(undef, undef, undef, 0.1);\n"
+  ++ "  }\n"
   ++ "' \"$@\"\n";
 
 let last_line = fn (path: str) ->
@@ -334,7 +342,8 @@ let run_all = fn (repo: str) -> fn (gates: gate list) -> fn (jobs: int) -> fn (s
       | Some i ->
         let p = tmp ++ "/" ++ str_of_int i in
         let t0 = time () in
-        let code = run ("sh '" ++ tmp ++ "/bounded.sh' " ++ str_of_int secs ++ " sh '" ++ p ++ ".sh' < /dev/null > '" ++ p ++ ".out' 2>&1") in
+        // `exec`, so the bound's parent is mgate itself (see bounded_sh)
+        let code = run ("exec sh '" ++ tmp ++ "/bounded.sh' " ++ str_of_int secs ++ " sh '" ++ p ++ ".sh' < /dev/null > '" ++ p ++ ".out' 2>&1") in
         let ms = int_of_float ((time () - t0) * 1000.0) in
         let _ = channel_send out (i, code, ms) in
         loop () in
