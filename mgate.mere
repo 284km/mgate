@@ -214,7 +214,10 @@ let ci_gates = fn (repo: str) ->
   let wf = repo ++ "/.github/workflows/ci.yml" in
   let text = read_file wf in
   let lines = str_split text "\n" in
-  let steps = cut_steps (job_lines lines "gates" false Nil) Nil Nil in
+  // (since Mere's CI split its gates into shards -- a matrix job,
+  //  gate_shards, each step guarded by its shard -- the gates job only
+  //  gathers their results: the steps are read from both)
+  let steps = cut_steps (list_append (job_lines lines "gate_shards" false Nil) (job_lines lines "gates" false Nil)) Nil Nil in
   let wired = list_fold (list_map steps step_gates) Nil (fn (a: gate list) -> fn (g: gate list) -> list_append a g) in
   // every script the workflow names ANYWHERE, so a script used by another job
   // is not called unwired
